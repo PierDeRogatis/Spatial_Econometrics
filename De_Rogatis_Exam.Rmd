@@ -1,0 +1,264 @@
+---
+title: "2L Spatial Econometrics Take-Home Exam"
+author: "Pierluigi De Rogatis"
+date: "07/08/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+# First of all, I load the necessary tables for the coding
+
+library(tidyverse)
+library(sf)
+library(spdep)
+library(haven)
+library(spatialreg)
+library(stats)
+library(MASS)
+library(aod)
+library(lmtest)
+
+```
+
+
+# QUESTION 1.A
+
+```{r}
+
+# Firstly, I load the dataset needed for the first exercise
+
+us_states_df <- st_read("C:/Users/pierl/OneDrive/UniEssex - IR/2021-22/2L - SPATIAL ECONOMETRICS/Exam/cb_2017_us_state_500k/cb_2017_us_state_500k.shp")
+
+# Then, I select only the 48 lower contiguous US states
+
+distinct(us_states_df, STUSPS, NAME)
+
+us_cont_sf <- filter(us_states_df, !(STUSPS %in% c("AK", "DC", "HI", "PR", "VI", "AS", "GU", "MP")))
+
+# To have the inverse distance, I first select the centroids of the 48 US States
+
+us_cont_centroid <- st_centroid(us_cont_sf)
+
+# After that, I can create the matrix of the distance between the centroids
+
+w_us_cont_dist <- st_distance(us_cont_centroid) %>%
+  matrix(nrow = nrow(us_cont_centroid), ncol = nrow(us_cont_centroid))
+
+# Then, I change the names of the rows and columns of the matrix
+
+dimnames(w_us_cont_dist) <- list(us_cont_centroid$NAME, us_cont_centroid$NAME)
+
+# Now, I can create the inverse distance matrix
+
+w_us_cont_inv_dist <- ifelse(w_us_cont_dist != 0, 1 / w_us_cont_dist, w_us_cont_dist)
+
+# Finally, I select and show the inverse distance between Alabama and West Virginia
+
+w_us_cont_inv_dist["Alabama", "West Virginia"]
+
+```
+
+
+# QUESTION 1.B
+
+```{r}
+
+# Therefore, the inverse relationship between Alabama and West Virginia is 1.163754e-06.
+
+```
+
+
+# QUESTION 2.A
+
+```{r}
+
+# First, I load the necessary dataset
+
+oxford_df <- read_dta("C:/Users/pierl/OneDrive/UniEssex - IR/2021-22/2L - SPATIAL ECONOMETRICS/Exam/oxford_data.dta")
+
+# And the necessary matrix, which I need to modify in order to be operationally ready for future calculations
+
+w_oxford_df <- read_dta("C:/Users/pierl/OneDrive/UniEssex - IR/2021-22/2L - SPATIAL ECONOMETRICS/Exam/oxford_w.dta")
+
+w_oxford_df$id <- NULL
+
+dimnames(w_oxford_df) <- list(oxford_df$statenm, oxford_df$statenm)
+
+w_oxford_df <- as.matrix(w_oxford_df)
+
+# Then, I standardize the matrix
+
+w_oxford_st <- apply(w_oxford_df, MARGIN = 1, function(x) {x / rowSums(w_oxford_df)})
+
+# And the AFDC benefits variable (ben95, as my response variable)
+
+oxford_df_st <- oxford_df %>% mutate_at(c('ben95'), ~(scale(.) %>% as.vector))
+
+# Then, I run the Moran's I test
+
+moran.test(oxford_df_st$ben95, mat2listw(w_oxford_st, style = "W"), zero.policy = TRUE)
+
+# Finally, I plot the Moran's I test
+
+moran.plot(oxford_df_st$ben95, mat2listw(w_oxford_st, style = "W"), zero.policy = TRUE)
+
+```
+
+
+# QUESTION 2.B
+
+```{r}
+
+# From the plot, we can learn that the Moran's I value is different from 0 and positive (0.54), and it is statistically significant (p-value is far less than 0.05). 
+
+# Therefore, we can reject the null hypothesis declaring the absence of negative autocorrelation (since the expected value -0.021 was negative and close to zero). Further, the variable is positive, which means that our variable of interest is clustered in noticeable patterns. Therefore, there is spatial autocorrelation in the dependent variable (AFDC benefits), i.e., I can reject the null hypothesis and conclude that the welfare benefits are spatially clustered together in such a distribution that it is unlikely to have occurred randomly.
+
+```
+
+
+# QUESTION 3.A
+
+```{r}
+
+# First, I create a general equation with the necessary variables for the Spatial Autoregressive Combined (SAC) model
+
+eq <- ben95 ~ rskpovpc + wage95 + instcoad + ipcfold + teitrend + match
+
+# Then, I insert in a SAC model
+
+est_sac_st <- sacsarlm(eq, oxford_df, mat2listw(w_oxford_st), Durbin = FALSE)
+
+# To check if we can use a simpler Spatial AutoRegressive (SAR) model, I will implement the Wald diagnostic test since it needs to calculate only the unrestricted (SAC) model rather than both models
+
+wald.test(Sigma = vcov(est_sac_st), b = coef(est_sac_st), Terms = 1:9)
+
+
+# Since the SAC model is correct, I can finally show the results
+
+summary(est_sac_st)
+
+# Then, I show the effects of government ideology on my response variable (AFDC benefits) with its uncertainty estimates
+
+N <- nrow(w_oxford_st)
+I <- diag(N)
+
+M <- solve(I - coef(est_sac_st)["rho"] * w_oxford_st)
+
+dir_eff <- sum(diag(M * coef(est_sac_st)["instcoad"])) / N
+ind_eff <- mean(rowSums(M * coef(est_sac_st)["instcoad"]) - diag(M * coef(est_sac_st)["instcoad"]))
+total_eff <- mean(rowSums(M * coef(est_sac_st)["instcoad"]))
+
+effect_ide <- data.frame(Government_Ideology = c("Average Direct Effect", "Average Indirect Effect", "Average Total Effect"),
+                         Value = c(dir_eff, ind_eff, total_eff))
+
+effect_ide
+
+eff_all <- impacts(est_sac_st, listw = mat2listw(w_oxford_st), R = 1000)
+summary(eff_all)
+
+# Finally, I show the effects that Illinois’s government ideology has on welfare state provision in its neighboring states
+
+nsims <- 1000
+
+coefs <- mvrnorm(n = nsims, coef(est_sac_st), vcov(est_sac_st))
+
+eff_gov_Illinois <- matrix(NA, nrow = N, ncol = nsims, dimnames = list(oxford_df$statenm, NULL))
+
+for(i in 1:nsims){
+  eff_gov_Illinois[, i] <- coefs[i, "instcoad"] * solve(I - coefs[i, "rho"] * w_oxford_st)[, "IL"]
+}
+
+eff_from_Illinois <- apply(eff_gov_Illinois, MARGIN = 1, quantile, c(0.05, 0.50, 0.95)) %>% t()
+
+w_oxford_st["IL", w_oxford_st["IL",] != 0]
+
+# First, the median effect with its 90% credible interval
+
+eff_from_Illinois[c("IN", "IA", "KY", "MO", "WI"),]
+
+# Then, its average effect
+
+eff_from_Illinois[c("IN", "IA", "KY", "MO", "WI"),] %>% rowMeans()
+
+```
+
+
+# QUESTION 3.B
+
+```{r}
+
+# 1. The SAR model, in this case, is inappropriate. Indeed, the Wald test to the SAC produce the following results:
+
+# Wald test:
+# ----------
+
+# Chi-squared test:
+# X2 = 4611.5, df = 9, P(> X2) = 0.0
+#
+# Therefore, we can reject the null hypothesis (p-value is less than 0.05) that some of the regression coefficients for the predictor variables (the parameters estimated by the model) are equal to zero. This means that we need all the regressors formulated in the SAC model (including lambda). 
+
+
+# 2.
+#     Effect    Value
+# 1   Direct 1.501696
+# 2 Indirect 2.574185
+# 3    Total 4.075881
+#
+# This means that the direct effect equals 1.501696, i.e. a one-unit increase in the government ideology variable of the state (more liberal) will increase the welfare provision in the same state on average (this can change between states, this is the average direct effect). Further, a one-unit increase in the government ideology variable will increase by 2.574185 the welfare provision in the neighboring countries on average (this is still the average indirect effect). Therefore, the total effect can be defined as a 4.075881 average increase in the welfare provision in the overall dataset following a one-unit increase in the government ideology variable of the state (this is still the average total effect). 
+
+# However, the p-value for the government ideology variable is 0.088, higher than the threshold of 0.05. This estimate means that the government ideology has not a statistically significant relationship with the response variable (welfare provision) in our SAC model. Indeed, if we measure the uncertainty estimates, we can easily notice that the naive standard error is 0.67267 for the average total effects, 0.6534 for the average indirect effects, and 0.032716 for the average direct effects. Furthermore, the 95% credible interval for the direct effect is between -0.2577 and 3.3138, while for the indirect effect is between -0.5341 and 11.427, and for the total effect is between -0.9797 and 14.034. 
+
+
+# 3.         IN        IA        KY        MO        WI 
+#     0.4243068 0.3267778 0.2898344 0.2482692 0.4344332 
+#
+# These are the average effects of Illinois' government ideology on welfare state provision (ben95) in its five neighboring states (the result of a one-unit increase in the variable "instcoad" in Illinois): 0.4243068 for Indiana IN, 0.3267778 for Iowa IA, 0.2898344 for Kentucky KY, 0.2482692 for Missouri MO, and 0.4344332 for Wisconsin WI. 
+
+#            5%       50%       95%
+# IN 0.02176984 0.3257221 0.9254285
+# IA 0.01553937 0.2464894 0.7183047
+# KY 0.01385295 0.2133650 0.6422853
+# MO 0.01133834 0.1810782 0.5523912
+# WI 0.02216979 0.3328109 0.9483188
+#
+# On the other hand, this is the median with the 90% credible interval of the effect of government ideology in Illinois in its five neighbors: Indiana IN, Iowa IA, Kentucky KY, Missouri MO, and Wisconsin WI.
+
+
+```
+
+
+# QUESTION 4.A
+
+```{r}
+
+# First, I use the MLE version to estimate the SAR version of the model
+
+est_sarml_st <- lagsarlm(eq, oxford_df, mat2listw(w_oxford_st))
+
+summary(est_sarml_st)
+summary(est_sarml_st$residuals)
+est_sarml_st$sse
+
+# Then, the S2SLS version
+
+est_sar2sls_st <- stsls(eq, oxford_df, mat2listw(w_oxford_st), robust = TRUE)
+
+summary(est_sar2sls_st)
+summary(est_sar2sls_st$residuals)
+est_sar2sls_st$sse
+
+```
+
+
+# QUESTION 4.B
+
+```{r}
+
+# The S2SLS is principally used when the dependent variable's error terms are correlated with the independent variables (i.e., endogeneity of X) or when there are feedback loops in the model. For this reason, the S2SLS creates a new instrumental variable uncorrelated with the error term but still correlated with our predictors. By contrast, with the MLE model, we are trying to determine the most "trustworthy" parameters in our SAR model based on the sample data. For this reason, they have different outcomes since the MLE tries to find the most likely estimate of the regression parameters while the S2SLS tries to minimize the sum of the residual errors (which is not the same purpose as before). For this reason, they have different parameters, which can be noticed by the difference in the standard error and z-value that each parameter has in the two models. Indeed, standard errors are less in the MLE model since it estimates the parameters more efficiently, while the S2SLS model only reduces the residual errors. This reasoning is also proven by the values of the z-value (ratio of the coefficient estimate with the standard error of the estimator) which are significantly higher (thus, less uncertainty) in the MLE model. This logic is finally confirmed by the SSE (sum of squared errors) which is significantly lower for the MLE model rather than the S2SLS model. Therefore, I can conclude that I trust the MLE model rather than the S2SLS in estimating the parameters for our Spatial Autoregressive model.  
+
+```
